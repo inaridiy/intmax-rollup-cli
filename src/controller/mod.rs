@@ -5,16 +5,15 @@ use std::{
     str::FromStr,
 };
 
+use anyhow::Context;
 use intmax_interoperability_plugin::ethers::{
     prelude::k256::ecdsa::SigningKey,
     types::{H160, U256},
     utils::secret_key_to_address,
 };
-#[cfg(feature = "bridge")]
-use intmax_rollup_interface::intmax_zkp_core::plonky2::field::types::Field;
 use intmax_rollup_interface::intmax_zkp_core::{
     plonky2::{
-        field::goldilocks_field::GoldilocksField,
+        field::{goldilocks_field::GoldilocksField, types::Field},
         plonk::config::{GenericConfig, GenericHashOut, PoseidonGoldilocksConfig},
     },
     rollup::gadgets::deposit_block::VariableIndex,
@@ -25,15 +24,14 @@ use intmax_rollup_interface::intmax_zkp_core::{
 use num_bigint::BigUint;
 use structopt::StructOpt;
 
-#[cfg(feature = "bridge")]
-use crate::service::interoperability::NetworkName;
 use crate::{
     service::{
         builder::*,
-        functions::{bulk_mint, merge, parse_address, transfer},
+        ethereum::gwei_to_wei,
+        functions::{bulk_mint, create_transaction_proof, merge, parse_address, transfer},
         interoperability::{
             activate_offer, get_network_config, get_offer, lock_offer, register_transfer,
-            unlock_offer, MakerTransferInfo, TakerTransferInfo,
+            unlock_offer, MakerTransferInfo, NetworkName, TakerTransferInfo,
         },
         read_distribution_from_csv,
     },
@@ -154,7 +152,21 @@ enum AccountCommand {
     },
     /// [upcoming features] Output the possession proof of your assets.
     #[structopt(name = "possession-proof")]
-    PossessionProof {},
+    PossessionProof {
+        // user_address: Option<String>
+    },
+    #[structopt(name = "transaction-proof")]
+    TransactionProof {
+        // #[structopt(long, short = "u")]
+        // user_address: Option<String>,
+        #[structopt()]
+        tx_hash: String,
+        #[structopt()]
+        receiver_address: String,
+        /// choose "scroll" (Scroll Alpha)
+        #[structopt(long = "network", short = "n")]
+        network_name: Option<String>,
+    },
 }
 
 #[derive(Debug, StructOpt)]
@@ -256,9 +268,10 @@ enum TransactionCommand {
 
 #[derive(Debug, StructOpt)]
 enum BlockCommand {
-    // /// Trigger to propose a block.
-    // #[structopt(name = "propose")]
-    // Propose {},
+    /// [advanced command] Trigger to propose a block.
+    #[cfg(feature = "advanced")]
+    #[structopt(name = "propose")]
+    Propose {},
     /// [advanced command] Sign to the proposal block.
     /// It is usually performed automatically after the transaction has been executed.
     /// If you do not sign the proposal block containing your transaction by the deadline,
@@ -268,10 +281,12 @@ enum BlockCommand {
         #[structopt(long, short = "u")]
         user_address: Option<String>,
     },
-    // /// Trigger to approve a block.
-    // #[structopt(name = "approve")]
-    // Approve {},
+    /// [advanced command] Trigger to approve a block.
+    #[cfg(feature = "advanced")]
+    #[structopt(name = "approve")]
+    Approve {},
     /// [advanced command] Verify a approved block.
+    #[cfg(feature = "advanced")]
     #[structopt(name = "verify")]
     Verify {
         #[structopt(long, short = "n")]
@@ -304,9 +319,12 @@ enum InteroperabilityCommand {
         /// send NFT (an alias of `--amount 1`)
         #[structopt(long = "nft")]
         is_nft: bool,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
+        /// Upper limit of acceptable gas price in Gwei
+        #[structopt(long)]
+        max_gas_price: Option<f64>,
     },
     #[structopt(name = "activate")]
     Activate {
@@ -314,7 +332,7 @@ enum InteroperabilityCommand {
         // user_address: Option<String>,
         #[structopt()]
         offer_id: usize,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
     },
@@ -343,7 +361,7 @@ enum InteroperabilityCommand {
         /// send NFT (an alias of `--amount 1`)
         #[structopt(long = "nft")]
         is_nft: bool,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
     },
@@ -353,9 +371,12 @@ enum InteroperabilityCommand {
         user_address: Option<String>,
         #[structopt()]
         offer_id: usize,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
+        /// If you already sent transaction on intmax, you can use its hash.
+        #[structopt(long = "tx-hash", short = "t")]
+        tx_hash: Option<String>,
     },
     #[structopt(name = "view")]
     View {
@@ -363,7 +384,7 @@ enum InteroperabilityCommand {
         // user_address: Option<String>,
         #[structopt()]
         offer_id: usize,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
         #[structopt(long = "reverse-offer", short = "r")]
@@ -392,7 +413,7 @@ enum BridgeCommand {
         #[structopt(long = "nft")]
         is_nft: bool,
 
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
     },
@@ -413,7 +434,7 @@ enum BridgeCommand {
         /// send NFT (an alias of `--amount 1`)
         #[structopt(long = "nft")]
         is_nft: bool,
-        /// choose "scroll" (Scroll Alpha) or "polygon" (Polygon zkEVM Testnet)
+        /// choose "scroll" (Scroll Alpha)
         #[structopt(long = "network", short = "n")]
         network_name: String,
     },
@@ -573,7 +594,7 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     // .map(|v| WrappedHashOut::from_str(&v).expect("fail to parse user address"))
                     .unwrap_or_else(WrappedHashOut::rand);
                 let account = Account::new(*private_key);
-                service.register_account(account.public_key).await;
+                service.register_account(account.public_key).await.unwrap();
                 wallet.add_account(account)?;
 
                 println!("new account added: {}", account.address);
@@ -590,8 +611,8 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     println!("the above account appears replaced by {nickname}");
                 }
 
-                service.trigger_propose_block().await;
-                service.trigger_approve_block().await;
+                service.trigger_propose_block().await.unwrap();
+                service.trigger_approve_block().await.unwrap();
             }
             AccountCommand::List {} => {
                 let mut account_list = wallet.data.keys().collect::<Vec<_>>();
@@ -727,15 +748,22 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     println!("Done!");
                 }
                 NicknameCommand::Remove { nicknames } => {
-                    for nickname in nicknames {
-                        nickname_table.remove(nickname)?;
-                    }
+                    // Process all given nicknames before displaying an error.
+                    nicknames.into_iter().for_each(|nickname| {
+                        match nickname_table.remove(nickname.clone()).and_then(|_| {
+                            let encoded_nickname_table =
+                                serde_json::to_string(&nickname_table).unwrap();
+                            std::fs::create_dir(wallet_dir_path.clone()).unwrap_or(());
+                            let mut file = File::create(nickname_file_path.clone())?;
+                            write!(file, "{}", encoded_nickname_table)?;
+                            file.flush()?;
 
-                    let encoded_nickname_table = serde_json::to_string(&nickname_table).unwrap();
-                    std::fs::create_dir(wallet_dir_path.clone()).unwrap_or(());
-                    let mut file = File::create(nickname_file_path)?;
-                    write!(file, "{}", encoded_nickname_table)?;
-                    file.flush()?;
+                            Ok(())
+                        }) {
+                            Ok(_) => println!("{nickname} is removed"),
+                            Err(error) => eprintln!("{error}"),
+                        }
+                    });
 
                     println!("Done!");
                 }
@@ -747,6 +775,54 @@ pub async fn invoke_command() -> anyhow::Result<()> {
             },
             AccountCommand::PossessionProof { .. } => {
                 anyhow::bail!("This is a upcoming feature.");
+
+                // let user_address = parse_address(&wallet, &nickname_table, user_address)?;
+                // let proof = service.get_possession_proof(user_address).await?;
+                // dbg!(proof);
+            }
+            AccountCommand::TransactionProof {
+                tx_hash,
+                receiver_address,
+                network_name,
+                ..
+            } => {
+                // let user_address = parse_address(&wallet, &nickname_table, user_address)?;
+                let receiver_address = if receiver_address.is_empty() {
+                    anyhow::bail!("empty recipient");
+                } else if receiver_address.starts_with("0x") {
+                    if receiver_address.len() != 18 {
+                        anyhow::bail!("recipient must be 8 bytes hex string with 0x-prefix");
+                    }
+
+                    Address::from_str(&receiver_address)?
+                } else if let Some(receiver_address) =
+                    nickname_table.nickname_to_address.get(&receiver_address)
+                {
+                    *receiver_address
+                } else {
+                    anyhow::bail!("unregistered nickname: recipient");
+                };
+
+                let network_name = if let Some(network_name) = network_name {
+                    let network_name: NetworkName =
+                        network_name.parse().context("invalid network name")?;
+                    #[cfg(not(feature = "enable-polygon-zkevm"))]
+                    if network_name == NetworkName::PolygonZkEvmTest {
+                        anyhow::bail!("Polygon ZKEVM testnet cannot be selected now");
+                    }
+
+                    Some(get_network_config(network_name))
+                } else {
+                    None
+                };
+
+                let tx_hash =
+                    WrappedHashOut::from_str(&tx_hash).expect("tx hash is invalid: {tx_hash}");
+                let witness =
+                    create_transaction_proof(&service, network_name, *tx_hash, receiver_address)
+                        .await?;
+
+                println!("witness: {witness}");
             }
         },
         SubCommand::Transaction { tx_command } => {
@@ -805,8 +881,8 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                         .deposit_assets(user_address, vec![deposit_info])
                         .await?;
 
-                    service.trigger_propose_block().await;
-                    service.trigger_approve_block().await;
+                    service.trigger_propose_block().await.unwrap();
+                    service.trigger_approve_block().await.unwrap();
                 }
                 TransactionCommand::Merge { user_address } => {
                     let user_address = parse_address(&wallet, &nickname_table, user_address)?;
@@ -957,11 +1033,11 @@ pub async fn invoke_command() -> anyhow::Result<()> {
             }
         }
         SubCommand::Block { block_command } => match block_command {
-            // BlockCommand::Propose {} => {
-            //     service.trigger_propose_block();
-            // }
+            #[cfg(feature = "advanced")]
+            BlockCommand::Propose {} => {
+                service.trigger_propose_block().await?;
+            }
             BlockCommand::Sign { user_address } => {
-                println!("block sign");
                 let user_address = parse_address(&wallet, &nickname_table, user_address)?;
                 let user_state = wallet
                     .data
@@ -972,11 +1048,13 @@ pub async fn invoke_command() -> anyhow::Result<()> {
 
                 wallet.backup()?;
             }
-            // BlockCommand::Approve {} => {
-            //     service.trigger_approve_block();
-            // }
+            #[cfg(feature = "advanced")]
+            BlockCommand::Approve {} => {
+                service.trigger_approve_block().await?;
+            }
+            #[cfg(feature = "advanced")]
             BlockCommand::Verify { block_number } => {
-                service.verify_block(block_number).await.unwrap();
+                service.verify_block(block_number).await?;
             }
         },
         #[cfg(feature = "interoperability")]
@@ -990,6 +1068,7 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                 taker_amount,
                 is_nft,
                 network_name,
+                max_gas_price,
             } => {
                 let user_address = parse_address(&wallet, &nickname_table, user_address)?;
                 {
@@ -1005,7 +1084,14 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     wallet.backup()?;
                 }
 
-                let network_config = get_network_config(network_name.parse()?);
+                let network_name: NetworkName =
+                    network_name.parse().context("invalid network name")?;
+                #[cfg(not(feature = "enable-polygon-zkevm"))]
+                if network_name == NetworkName::PolygonZkEvmTest {
+                    anyhow::bail!("Polygon ZKEVM testnet cannot be selected now");
+                }
+
+                let network_config = get_network_config(network_name);
                 let secret_key =
                     std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
 
@@ -1088,6 +1174,44 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     "transfer amount is too much"
                 );
 
+                if variable_index != 0.into() {
+                    anyhow::bail!("token ID must be 0");
+                }
+
+                let temporary_receiver_address = match network_name {
+                    NetworkName::ScrollAlpha => Address(F::from_canonical_u64(1)),
+                    NetworkName::PolygonZkEvmTest => Address(F::from_canonical_u64(2)),
+                };
+                let output_asset = ContributedAsset {
+                    receiver_address: temporary_receiver_address,
+                    kind: TokenKind {
+                        contract_address,
+                        variable_index,
+                    },
+                    amount: maker_amount,
+                };
+                #[cfg(feature = "verbose")]
+                dbg!(serde_json::to_string(&output_asset).unwrap());
+
+                let tx_hash =
+                    transfer(&service, &mut wallet, user_address, &[output_asset]).await?;
+
+                wallet.backup()?;
+
+                if tx_hash.is_none() {
+                    anyhow::bail!("exit transaction should exist");
+                }
+
+                let tx_hash = tx_hash.unwrap();
+
+                let witness = create_transaction_proof(
+                    &service,
+                    Some(network_config.clone()),
+                    *tx_hash,
+                    output_asset.receiver_address,
+                )
+                .await?;
+
                 let signer_key =
                     SigningKey::from_bytes(&hex::decode(&secret_key).unwrap()).unwrap();
                 let my_account = secret_key_to_address(&signer_key);
@@ -1106,7 +1230,7 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                 let receiving_transfer_info = TakerTransferInfo {
                     address: H160::default(), // anyone can activate
                     intmax_account: receiver_address,
-                    token_address: H160::default(),
+                    token_address: H160::default(), // TODO: other allow token address
                     amount: taker_amount,
                 };
 
@@ -1115,37 +1239,32 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     secret_key,
                     sending_transfer_info,
                     receiving_transfer_info,
+                    max_gas_price.map(gwei_to_wei),
+                    witness,
                 )
-                .await;
+                .await?;
                 println!("offer_id: {}", offer_id);
-
-                let output_asset = ContributedAsset {
-                    receiver_address: Address::default(),
-                    kind: TokenKind {
-                        contract_address,
-                        variable_index,
-                    },
-                    amount: maker_amount,
-                };
-                #[cfg(feature = "verbose")]
-                dbg!(serde_json::to_string(&output_asset).unwrap());
-
-                transfer(&service, &mut wallet, user_address, &[output_asset]).await?;
-
-                wallet.backup()?;
             }
             InteroperabilityCommand::Activate {
+                // user_address,
                 offer_id,
                 network_name,
                 ..
             } => {
-                // let user_address = parse_address(&wallet, user_address)?;
+                // let _user_address = parse_address(&wallet, &nickname_table, user_address)?;
                 // let user_state = wallet
                 //     .data
                 //     .get_mut(&user_address)
                 //     .expect("user address was not found in wallet");
 
-                let network_config = get_network_config(network_name.parse()?);
+                let network_name: NetworkName =
+                    network_name.parse().context("invalid network name")?;
+                #[cfg(not(feature = "enable-polygon-zkevm"))]
+                if network_name == NetworkName::PolygonZkEvmTest {
+                    anyhow::bail!("Polygon ZKEVM testnet cannot be selected now");
+                }
+
+                let network_config = get_network_config(network_name);
                 let secret_key =
                     std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
 
@@ -1157,8 +1276,8 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                 }
 
                 // reflect to deposit tree
-                service.trigger_propose_block().await;
-                service.trigger_approve_block().await;
+                service.trigger_propose_block().await.unwrap();
+                service.trigger_approve_block().await.unwrap();
             }
             InteroperabilityCommand::Lock {
                 user_address,
@@ -1185,7 +1304,14 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     wallet.backup()?;
                 }
 
-                let network_config = get_network_config(network_name.parse()?);
+                let network_name: NetworkName =
+                    network_name.parse().context("invalid network name")?;
+                #[cfg(not(feature = "enable-polygon-zkevm"))]
+                if network_name == NetworkName::PolygonZkEvmTest {
+                    anyhow::bail!("Polygon ZKEVM testnet cannot be selected now");
+                }
+
+                let network_config = get_network_config(network_name);
                 let secret_key =
                     std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
 
@@ -1301,6 +1427,7 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                 user_address,
                 offer_id,
                 network_name,
+                tx_hash,
             } => {
                 let user_address = parse_address(&wallet, &nickname_table, user_address)?;
                 {
@@ -1316,7 +1443,14 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                     wallet.backup()?;
                 }
 
-                let network_config = get_network_config(network_name.parse()?);
+                let network_name: NetworkName =
+                    network_name.parse().context("invalid network name")?;
+                #[cfg(not(feature = "enable-polygon-zkevm"))]
+                if network_name == NetworkName::PolygonZkEvmTest {
+                    anyhow::bail!("Polygon ZKEVM testnet cannot be selected now");
+                }
+
+                let network_config = get_network_config(network_name);
                 let secret_key =
                     std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set in .env file");
 
@@ -1398,30 +1532,43 @@ pub async fn invoke_command() -> anyhow::Result<()> {
                 };
                 #[cfg(feature = "verbose")]
                 dbg!(serde_json::to_string(&output_asset).unwrap());
-                let tx_hash = transfer(&service, &mut wallet, user_address, &[output_asset])
-                    .await?
-                    .expect("no transaction was sent");
 
-                let witness = {
-                    // XXX
-                    service
-                        .get_transaction_confirmation_witness(tx_hash, taker_address)
+                let tx_hash = if let Some(tx_hash) = tx_hash {
+                    tx_hash.parse().expect("given tx-hash is invalid")
+                } else {
+                    transfer(&service, &mut wallet, user_address, &[output_asset])
                         .await?
-
-                    // let eth_wallet = LocalWallet::new_with_signer(
-                    //     signer_key,
-                    //     my_account,
-                    //     network_config.chain_id,
-                    // );
-                    // let signature = eth_wallet
-                    //     .sign_message(Bytes::from(offer.taker_intmax))
-                    //     .await?;
-                    // signature
-                    //     .verify(offer.taker_intmax, my_account)
-                    //     .expect("fail to verify signature");
-                    // signature.to_vec().into()
+                        .expect("no transaction was sent")
                 };
-                // dbg!(&witness);
+
+                let witness = create_transaction_proof(
+                    &service,
+                    Some(network_config.clone()),
+                    *tx_hash,
+                    output_asset.receiver_address,
+                )
+                .await?;
+
+                // let witness = {
+                //     // XXX
+                //     service
+                //         .get_transaction_confirmation_witness(tx_hash, taker_address)
+                //         .await?
+
+                //     // let eth_wallet = LocalWallet::new_with_signer(
+                //     //     signer_key,
+                //     //     my_account,
+                //     //     network_config.chain_id,
+                //     // );
+                //     // let signature = eth_wallet
+                //     //     .sign_message(Bytes::from(offer.taker_intmax))
+                //     //     .await?;
+                //     // signature
+                //     //     .verify(offer.taker_intmax, my_account)
+                //     //     .expect("fail to verify signature");
+                //     // signature.to_vec().into()
+                // };
+                // // dbg!(&witness);
 
                 let offer_id: U256 = offer_id.into();
                 let _is_unlocked =
